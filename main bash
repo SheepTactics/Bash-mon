@@ -1,126 +1,689 @@
-#!/usr/bin/env bash
-# === SysMon Installer + Monitor Script ===
-# Description: installs a lightweight terminal system monitor to $HOME/.local/bin
-# and creates a Desktop launcher. The running monitor prints compact stats
-# with numeric fields rendered bold using ANSI escape codes.
-
 bash << 'INSTALL'
-SCRIPT_DIR="$HOME/.local/bin"
-SCRIPT_PATH="$SCRIPT_DIR/sysmon.sh"
-DESKTOP_FILE="$HOME/Desktop/SysMon.desktop"
-mkdir -p "$SCRIPT_DIR" "$HOME/Desktop"
+# === SysMon installer ===
+# Installs:
+#   ~/.local/bin/sysmon.sh  = actual monitor
+#   ~/.local/bin/stat       = command launcher
+#   optional Desktop icon   = only if visual mode is selected
 
-# === Create monitor script file ===
-cat > "$SCRIPT_PATH" << 'MONITOR_EOF'
+INSTALL_DIR="$HOME/.local/bin"
+MONITOR_PATH="$INSTALL_DIR/sysmon.sh"
+COMMAND_PATH="$INSTALL_DIR/stat"
+DESKTOP_PATH="$HOME/Desktop/SysMon.desktop"
+
+# --- Ask install mode ---
+# Read from /dev/tty because this installer's stdin is the heredoc itself.
+choice=""
+if [ -e /dev/tty ]; then
+  read -rp "SysMon install mode: 1=Terminal command only, 2=Command + desktop icon [1]: " choice < /dev/tty || choice="1"
+else
+  choice="1"
+fi
+
+case "$choice" in
+  2|v|V|visual|Visual) MODE="visual" ;;
+  *) MODE="terminal" ;;
+esac
+
+mkdir -p "$INSTALL_DIR" "$HOME/.cache"
+if [ "$MODE" = "visual" ]; then
+  mkdir -p "$HOME/Desktop"
+fi
+
+# ============================================================
+# Write the actual monitor script.
+# ============================================================
+cat > "$MONITOR_PATH" << 'MONITOR_EOF'
 #!/bin/bash
-# === Initial CPU snapshot ===
-cpu_line=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9,$10,$11}' /proc/stat)
-read -r user nice system idle iowait irq softirq steal guest guest_nice <<< "$cpu_line"
-prev_total=$(($user+$nice+$system+$idle+$iowait+$irq+$softirq+$steal+$guest+$guest_nice))
-prev_idletot=$(($idle+$iowait))
+# === SysMon monitor ===
+# Draws a persistent status area at the top of the terminal.
+# It is intended to run in the background so the shell prompt remains usable.
 
-# === Initial disk snapshot (mmcblk0) ===
-disk_line=$(awk '$3 == "mmcblk0" {print $6, $10}' /proc/diskstats)
-read -r prev_r_sectors prev_w_sectors <<< "$disk_line"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+READY_FILE="${SYSMON_READY:-}"
+TTY="${SYSMON_TTY:-$(tty 2>/dev/null || true)}"
 
-# === Determine network interface and initial snapshot ===
-net_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
-[ -z "$net_iface" ] && net_iface=$(ls /sys/class/net | grep -v lo | head -1)
-net_line=$(awk -v iface="$net_iface" '$1 == iface":" {print $2, $10}' /proc/net/dev)
-read -r prev_rx_bytes prev_tx_bytes <<< "$net_line"
+# Must have a real terminal to draw on.
+case "$TTY" in
+  /dev/*) ;;
+  *) exit 0 ;;
+esac
 
-# === Prepare terminal ===
-printf '\033[2J\033[H'
-sleep 1
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
-# === Main loop: sample and display every second ===
-while true; do
-  # --- Temperature reading (if available)
-  if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
-    temp=$(echo "scale=1; $(cat /sys/class/thermal/thermal_zone0/temp) / 1000" | bc)
-  else
-    temp="N/A"
+# Per-terminal PID file.
+# Example: /dev/pts/3 becomes pts_3.
+tty_id=${TTY#/dev/}
+tty_id=${tty_id//\//_}
+PID_FILE="$CACHE_DIR/sysmon-$tty_id.pid"
+
+# Prevent duplicate instance in the same terminal.
+if [ -f "$PID_FILE" ]; then
+  old_pid=""
+  read -r old_pid < "$PID_FILE" 2>/dev/null || true
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    # Tell launcher we are already alive/ready.
+    [ -n "$READY_FILE" ] && : > "$READY_FILE" 2>/dev/null || true
+    exit 0
+  fi
+  rm -f "$PID_FILE" 2>/dev/null || true
+fi
+
+printf '%s\n' "$$" > "$PID_FILE"
+
+# Redirect all output to the target terminal.
+exec </dev/null >"$TTY" 2>/dev/null
+
+cleanup() {
+  # Re-enable line wrap, reset scroll region, clear screen/scrollback, remove PID.
+  # ESC[?7h  = enable auto-wrap
+  # ESC[;r   = reset scroll region
+  # ESC[H    = cursor home
+  # ESC[2J   = clear screen
+  # ESC[3J   = clear scrollback where supported
+  printf '\033[?7h\033[;r\033[H\033[2J\033[3J' 2>/dev/null || true
+  rm -f "$PID_FILE" 2>/dev/null || true
+}
+trap 'exit 0' INT TERM HUP
+trap cleanup EXIT
+
+# Optional voltage reading. Only use vcgencmd if it exists.
+have_power=0
+command -v vcgencmd >/dev/null 2>&1 && have_power=1
+
+get_size() {
+  # Get terminal rows/cols from the target TTY.
+  local sz
+  sz=$(stty size <"$TTY" 2>/dev/null) || return 1
+  lines=${sz%% *}
+  cols=${sz##* }
+  [[ $lines =~ ^[0-9]+$ ]] || lines=24
+  [[ $cols =~ ^[0-9]+$ ]] || cols=80
+  (( lines >= 2 )) || lines=2
+  (( cols >= 2 )) || cols=2
+}
+
+# First run: clear screen and scrollback where supported.
+# Then move cursor to bottom so the shell prompt will appear there.
+get_size || { lines=24; cols=80; }
+printf '\033[?7h\033[;r\033[H\033[2J\033[3J\033[%d;1H' "$lines"
+
+# --- Initial CPU snapshot ---
+# /proc/stat counters are cumulative; usage is calculated from deltas.
+read -r _ user nice system idle iowait irq softirq steal guest guest_nice _ < /proc/stat
+prev_total=$(( ${user:-0} + ${nice:-0} + ${system:-0} + ${idle:-0} + ${iowait:-0} + ${irq:-0} + ${softirq:-0} + ${steal:-0} + ${guest:-0} + ${guest_nice:-0} ))
+prev_idletot=$(( ${idle:-0} + ${iowait:-0} ))
+
+# --- Initial disk snapshot ---
+# mmcblk0 fields used:
+#   $6 = sectors read
+#   $10 = sectors written
+# Sectors are normally 512 bytes.
+prev_r_sectors=0
+prev_w_sectors=0
+while read -r _ _ name _ _ rd_sectors _ _ _ wr_sectors _; do
+  if [ "$name" = "mmcblk0" ]; then
+    prev_r_sectors=${rd_sectors:-0}
+    prev_w_sectors=${wr_sectors:-0}
+    break
+  fi
+done < /proc/diskstats
+
+# --- Initial network interface selection ---
+# Prefer the interface used for the default route.
+# Fall back to /proc/net/route, then first non-lo interface.
+net_iface=""
+if command -v ip >/dev/null 2>&1 && command -v awk >/dev/null 2>&1; then
+  net_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' 2>/dev/null)
+fi
+
+if [ -z "$net_iface" ]; then
+  if [ -r /proc/net/route ]; then
+    {
+      read -r _
+      while read -r iface dest _; do
+        # Destination 00000000 = default route.
+        if [ "$dest" = "00000000" ]; then
+          net_iface=$iface
+          break
+        fi
+      done
+    } < /proc/net/route
+  fi
+fi
+
+if [ -z "$net_iface" ]; then
+  for i in /sys/class/net/*; do
+    [ -e "$i" ] || continue
+    n=${i##*/}
+    if [ "$n" != "lo" ]; then
+      net_iface=$n
+      break
+    fi
+  done
+fi
+
+# --- Initial network snapshot ---
+# /proc/net/dev:
+#   first field after interface = RX bytes
+#   ninth field after interface = TX bytes
+prev_rx_bytes=0
+prev_tx_bytes=0
+if [ -n "$net_iface" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      *:*)
+        iface=${line%%:*}
+        iface=${iface// /}
+        if [ "$iface" = "$net_iface" ]; then
+          rest=${line#*:}
+          read -r rx_bytes _ _ _ _ _ _ _ tx_bytes _ <<< "$rest"
+          prev_rx_bytes=${rx_bytes:-0}
+          prev_tx_bytes=${tx_bytes:-0}
+          break
+        fi
+        ;;
+    esac
+  done < /proc/net/dev
+fi
+
+ESC=$'\e'
+first=1
+prev_lines=$lines
+prev_cols=$cols
+old_status_lines=0
+
+# ============================================================
+# Main loop: sample once per second and redraw status.
+# ============================================================
+while :; do
+  # Exit if the terminal disappears or becomes unwritable.
+  [ -w "$TTY" ] || exit 0
+
+  # --- Temperature ---
+  # Value is in millidegrees C. Format one decimal without using bc.
+  temp="N/A"
+  if [ -r /sys/class/thermal/thermal_zone0/temp ]; then
+    raw_temp=$(< /sys/class/thermal/thermal_zone0/temp)
+    if [[ $raw_temp =~ ^[0-9]+$ ]]; then
+      t_int=$(( raw_temp / 1000 ))
+      t_frac=$(( (raw_temp % 1000) / 100 ))
+      # Keep width stable and avoid overflowing the compact field.
+      (( t_int > 99 )) && { t_int=99; t_frac=9; }
+      printf -v temp "%02d.%d" "$t_int" "$t_frac"
+    fi
   fi
 
-  # --- CPU usage calculation
-  cpu_line=$(awk '/^cpu / {print $2,$3,$4,$5,$6,$7,$8,$9,$10,$11}' /proc/stat)
-  read -r user nice system idle iowait irq softirq steal guest guest_nice <<< "$cpu_line"
-  total=$(($user+$nice+$system+$idle+$iowait+$irq+$softirq+$steal+$guest+$guest_nice))
-  idletot=$(($idle+$iowait))
-  delta_total=$(($total-$prev_total)); delta_idle=$(($idletot-$prev_idletot))
-  [ $delta_total -gt 0 ] && cpu_perc=$(echo "scale=1; 100*($delta_total-$delta_idle)/$delta_total" | bc) || cpu_perc=0.0
-  cpu_perc=$(printf "%04.1f" "$cpu_perc")
+  # --- CPU ---
+  # Calculate usage in tenths of a percent.
+  # 999 tenths = 99.9%, intentionally capped to save width.
+  read -r _ user nice system idle iowait irq softirq steal guest guest_nice _ < /proc/stat
+  total=$(( ${user:-0} + ${nice:-0} + ${system:-0} + ${idle:-0} + ${iowait:-0} + ${irq:-0} + ${softirq:-0} + ${steal:-0} + ${guest:-0} + ${guest_nice:-0} ))
+  idletot=$(( ${idle:-0} + ${iowait:-0} ))
 
-  # --- Memory usage calculation
-  mem_line=$(awk '/MemTotal/{tot=$2}/MemAvailable/{avail=$2}END{print tot,avail}' /proc/meminfo)
-  read -r mem_total mem_avail <<< "$mem_line"
-  ram_perc=$(printf "%04.1f" "$(echo "scale=1; ($mem_total-$mem_avail)*100/$mem_total" | bc)")
-
-  # --- Power reading (vcgencmd) — best-effort
-  pwr_raw=$(vcgencmd pmic_read_adc EXT5V_V 2>/dev/null)
-  pwr=$(echo "$pwr_raw" | grep -oP '=\K[0-9]+\.[0-9]+' | cut -c1-4)
-  [ -z "$pwr" ] && pwr="N/A"
-
-  # --- Disk I/O delta calculation (reads/writes since last sample)
-  disk_line=$(awk '$3 == "mmcblk0" {print $6, $10}' /proc/diskstats)
-  if [ -n "$disk_line" ]; then
-    read -r r_sectors w_sectors <<< "$disk_line"
-    delta_r=$(($r_sectors-$prev_r_sectors)); delta_w=$(($w_sectors-$prev_w_sectors))
+  if (( first )); then
+    cpu_tenths=0
   else
-    delta_r=0; delta_w=0; r_sectors=${prev_r_sectors:-0}; w_sectors=${prev_w_sectors:-0}
+    dt=$(( total - prev_total ))
+    di=$(( idletot - prev_idletot ))
+    if (( dt > 0 )); then
+      cpu_tenths=$(( 1000 * (dt - di) / dt ))
+      (( cpu_tenths < 0 )) && cpu_tenths=0
+      (( cpu_tenths > 999 )) && cpu_tenths=999
+    else
+      cpu_tenths=0
+    fi
   fi
-  [ $delta_r -gt 1998 ] && read_val=$(echo "scale=0;$delta_r/2048"|bc) && read_unit="MB/s" || { read_val=$(echo "scale=0;$delta_r/2"|bc); read_unit="KB/s"; }
-  [ $delta_w -gt 1998 ] && write_val=$(echo "scale=0;$delta_w/2048"|bc) && write_unit="MB/s" || { write_val=$(echo "scale=0;$delta_w/2"|bc); write_unit="KB/s"; }
-  read_val=$(printf "%03d" "$read_val"); write_val=$(printf "%03d" "$write_val")
+  prev_total=$total
+  prev_idletot=$idletot
 
-  # --- Network I/O delta calculation (rx/tx since last sample)
-  net_line=$(awk -v iface="$net_iface" '$1 == iface":" {print $2, $10}' /proc/net/dev)
-  if [ -n "$net_line" ]; then
-    read -r rx_bytes tx_bytes <<< "$net_line"
-    delta_rx=$(($rx_bytes-$prev_rx_bytes)); delta_tx=$(($tx_bytes-$prev_tx_bytes))
+  # --- RAM ---
+  # MemAvailable is preferred over MemFree because it reflects usable memory.
+  mem_total=0
+  mem_avail=0
+  while read -r key val _; do
+    case "$key" in
+      MemTotal:) mem_total=${val:-0} ;;
+      MemAvailable:) mem_avail=${val:-0} ;;
+    esac
+    (( mem_total > 0 && mem_avail > 0 )) && break
+  done < /proc/meminfo
+
+  if (( mem_total > 0 )); then
+    used=$(( mem_total - mem_avail ))
+    (( used < 0 )) && used=0
+    ram_tenths=$(( 1000 * used / mem_total ))
+    (( ram_tenths > 999 )) && ram_tenths=999
   else
-    delta_rx=0; delta_tx=0; rx_bytes=${prev_rx_bytes:-0}; tx_bytes=${prev_tx_bytes:-0}
+    ram_tenths=0
   fi
-  [ $delta_rx -gt 1048575 ] && in_val=$(echo "scale=0;$delta_rx/1048576"|bc) && in_unit="MB/s" || { in_val=$(echo "scale=0;$delta_rx/1024"|bc); in_unit="KB/s"; }
-  [ $delta_tx -gt 1048575 ] && out_val=$(echo "scale=0;$delta_tx/1048576"|bc) && out_unit="MB/s" || { out_val=$(echo "scale=0;$delta_tx/1024"|bc); out_unit="KB/s"; }
-  in_val=$(printf "%03d" "$in_val"); out_val=$(printf "%03d" "$out_val")
 
-  # --- Format output: numeric fields wrapped in ANSI bold codes
-  printf -v data "TMP:\033[1m%.1f\033[0mC|CPU:\033[1m%s\033[0m%%|RAM:\033[1m%s\033[0m%%|PWR:\033[1m%s\033[0mV|R:\033[1m%s\033[0m%s|W:\033[1m%s\033[0m%s|I:\033[1m%s\033[0m%s|O:\033[1m%s\033[0m%s" \
+  # --- Voltage/power ---
+  # Best effort only. Trim to 4 characters, e.g. 5.06.
+  pwr="N/A"
+  if (( have_power )); then
+    pwr_raw=$(vcgencmd pmic_read_adc EXT5V_V 2>/dev/null || true)
+    if [[ $pwr_raw =~ =([0-9]+\.[0-9]+) ]]; then
+      pwr=${BASH_REMATCH[1]}
+      pwr=${pwr:0:4}
+    fi
+  fi
+
+  # --- Disk I/O ---
+  # Delta sectors since last sample.
+  # 512 bytes per sector:
+  #   delta / 2     = KB
+  #   delta / 2048  = MB
+  r_sectors=0
+  w_sectors=0
+  while read -r _ _ name _ _ rd_sectors _ _ _ wr_sectors _; do
+    if [ "$name" = "mmcblk0" ]; then
+      r_sectors=${rd_sectors:-0}
+      w_sectors=${wr_sectors:-0}
+      break
+    fi
+  done < /proc/diskstats
+
+  if (( first )); then
+    delta_r=0
+    delta_w=0
+  else
+    delta_r=$(( r_sectors - prev_r_sectors ))
+    delta_w=$(( w_sectors - prev_w_sectors ))
+    (( delta_r < 0 )) && delta_r=0
+    (( delta_w < 0 )) && delta_w=0
+  fi
+  prev_r_sectors=$r_sectors
+  prev_w_sectors=$w_sectors
+
+  if (( delta_r > 1998 )); then
+    read_val=$(( delta_r / 2048 ))
+    read_unit="MBs"
+  else
+    read_val=$(( delta_r / 2 ))
+    read_unit="KBs"
+  fi
+
+  if (( delta_w > 1998 )); then
+    write_val=$(( delta_w / 2048 ))
+    write_unit="MBs"
+  else
+    write_val=$(( delta_w / 2 ))
+    write_unit="KBs"
+  fi
+
+  (( read_val < 0 )) && read_val=0
+  (( write_val < 0 )) && write_val=0
+  printf -v read_val "%03d" "$read_val"
+  printf -v write_val "%03d" "$write_val"
+
+  # --- Network I/O ---
+  # Delta bytes since last sample.
+  rx_bytes=0
+  tx_bytes=0
+  if [ -n "$net_iface" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        *:*)
+          iface=${line%%:*}
+          iface=${iface// /}
+          if [ "$iface" = "$net_iface" ]; then
+            rest=${line#*:}
+            read -r rx_bytes _ _ _ _ _ _ _ tx_bytes _ <<< "$rest"
+            rx_bytes=${rx_bytes:-0}
+            tx_bytes=${tx_bytes:-0}
+            break
+          fi
+          ;;
+      esac
+    done < /proc/net/dev
+  fi
+
+  if (( first )); then
+    delta_rx=0
+    delta_tx=0
+  else
+    delta_rx=$(( rx_bytes - prev_rx_bytes ))
+    delta_tx=$(( tx_bytes - prev_tx_bytes ))
+    (( delta_rx < 0 )) && delta_rx=0
+    (( delta_tx < 0 )) && delta_tx=0
+  fi
+  prev_rx_bytes=$rx_bytes
+  prev_tx_bytes=$tx_bytes
+
+  if (( delta_rx > 1048575 )); then
+    in_val=$(( delta_rx / 1048576 ))
+    in_unit="MBs"
+  else
+    in_val=$(( delta_rx / 1024 ))
+    in_unit="KBs"
+  fi
+
+  if (( delta_tx > 1048575 )); then
+    out_val=$(( delta_tx / 1048576 ))
+    out_unit="MBs"
+  else
+    out_val=$(( delta_tx / 1024 ))
+    out_unit="KBs"
+  fi
+
+  (( in_val < 0 )) && in_val=0
+  (( out_val < 0 )) && out_val=0
+  printf -v in_val "%03d" "$in_val"
+  printf -v out_val "%03d" "$out_val"
+
+  # --- Format CPU/RAM ---
+  # Tenths -> fixed-width xx.x, capped at 99.9.
+  printf -v cpu_perc "%02d.%d" $(( cpu_tenths / 10 )) $(( cpu_tenths % 10 ))
+  printf -v ram_perc "%02d.%d" $(( ram_tenths / 10 )) $(( ram_tenths % 10 ))
+
+  # --- Build output strings ---
+  # plain = visible text only, used for width/wrap calculations.
+  # data  = bold-number version, used when it fits on one line.
+  printf -v plain "TMP:%sC|CPU:%s%%|RAM:%s%%|PWR:%sV|R:%s%s|W:%s%s|I:%s%s|O:%s%s" \
     "$temp" "$cpu_perc" "$ram_perc" "$pwr" "$read_val" "$read_unit" "$write_val" "$write_unit" "$in_val" "$in_unit" "$out_val" "$out_unit"
 
-  # --- Display and cursor handling (keep one-line overlay)
-  echo -ne "\033[s\033[1;1H\033[K$data\033[u"
+  printf -v data "TMP:${ESC}[1m%s${ESC}[0mC|CPU:${ESC}[1m%s${ESC}[0m%%|RAM:${ESC}[1m%s${ESC}[0m%%|PWR:${ESC}[1m%s${ESC}[0mV|R:${ESC}[1m%s${ESC}[0m%s|W:${ESC}[1m%s${ESC}[0m%s|I:${ESC}[1m%s${ESC}[0m%s|O:${ESC}[1m%s${ESC}[0m%s" \
+    "$temp" "$cpu_perc" "$ram_perc" "$pwr" "$read_val" "$read_unit" "$write_val" "$write_unit" "$in_val" "$in_unit" "$out_val" "$out_unit"
 
-  # --- Update previous-sample variables
-  prev_total=$total; prev_idletot=$idletot; prev_r_sectors=$r_sectors
-  prev_w_sectors=$w_sectors; prev_rx_bytes=$rx_bytes; prev_tx_bytes=$tx_bytes
+  # --- Terminal size ---
+  # If size query fails, keep the previous size instead of flickering.
+  if ! get_size; then
+    lines=$prev_lines
+    cols=$prev_cols
+  fi
+  (( lines >= 2 )) || lines=2
+  (( cols >= 2 )) || cols=2
 
-  # --- Sleep until next sample
+  # Full clear is only allowed on first run or terminal resize.
+  clear_all=0
+  if (( lines != prev_lines || cols != prev_cols )); then
+    clear_all=1
+  fi
+
+  # --- Status height calculation ---
+  # Determine how many top lines the status needs.
+  # Always leave at least one line for input.
+  plain_len=${#plain}
+  req_lines=$(( (plain_len + cols - 1) / cols ))
+  (( req_lines < 1 )) && req_lines=1
+
+  max_status_lines=$(( lines - 1 ))
+  (( max_status_lines < 1 )) && max_status_lines=1
+
+  if (( req_lines > max_status_lines )); then
+    status_lines=$max_status_lines
+  else
+    status_lines=$req_lines
+  fi
+
+  # If one line fits, use bold data.
+  # If wrapped/truncated, use plain text lines to avoid ANSI wrap glitches.
+  if (( status_lines == 1 )); then
+    if (( plain_len > cols )); then
+      display=${plain:0:cols}
+    else
+      display=$data
+    fi
+  else
+    display=""
+  fi
+
+  # --- Layout changes ---
+  # layout_change updates the scroll region.
+  # Scroll region makes normal terminal output scroll below the status area.
+  layout_change=0
+  if (( first || clear_all || status_lines != old_status_lines )); then
+    layout_change=1
+  fi
+
+  if (( clear_all )); then
+    # Clear screen and scrollback on first run or resize.
+    printf '\033[?7h\033[;r\033[H\033[2J\033[3J'
+  fi
+
+  if (( layout_change )); then
+    # ESC[top;bottomr sets scrolling region.
+    # Status lines are above the region, input/output live below.
+    if (( status_lines < lines )); then
+      printf '\033[%d;%dr' $(( status_lines + 1 )) "$lines"
+    else
+      printf '\033[;r'
+    fi
+    printf '\033[%d;1H' "$lines"
+  fi
+
+  # --- Clear only old status lines ---
+  max_clear=$old_status_lines
+  (( status_lines > max_clear )) && max_clear=$status_lines
+  (( max_clear < 1 )) && max_clear=1
+  (( max_clear > lines )) && max_clear=$lines
+
+  # --- Draw in one buffered write ---
+  # ESC 7 / ESC 8 = save/restore cursor.
+  # ESC[?7l       = disable auto-wrap while drawing status.
+  # ESC[?7h       = re-enable auto-wrap afterward.
+  # Disabling wrap prevents narrow-window cursor teleport/flicker.
+  out=$'\0337\033[?7l'
+
+  if (( status_lines == 1 )); then
+    printf -v chunk '\033[1;1H\033[K%s' "$display"
+    out+=$chunk
+
+    # Clear any extra lines left over from a previous multi-line layout.
+    for (( i=2; i<=max_clear; i++ )); do
+      printf -v chunk '\033[%d;1H\033[K' "$i"
+      out+=$chunk
+    done
+  else
+    # Multi-line narrow-window mode:
+    # split plain text manually instead of relying on terminal wrapping.
+    offset=0
+    for (( i=1; i<=max_clear; i++ )); do
+      if (( i <= status_lines )); then
+        line=${plain:offset:cols}
+        printf -v chunk '\033[%d;1H\033[K%s' "$i" "$line"
+        offset=$(( offset + cols ))
+      else
+        printf -v chunk '\033[%d;1H\033[K' "$i"
+      fi
+      out+=$chunk
+    done
+  fi
+
+  out+=$'\033[?7h\0338'
+  printf '%s' "$out" 2>/dev/null || exit 0
+
+  old_status_lines=$status_lines
+  prev_lines=$lines
+  prev_cols=$cols
+
+  # Signal ready to the launcher after first successful draw.
+  if (( first )); then
+    [ -n "$READY_FILE" ] && : > "$READY_FILE" 2>/dev/null || true
+    first=0
+  fi
+
   sleep 1
 done
 MONITOR_EOF
 
-# === Make the monitor script executable ===
-chmod +x "$SCRIPT_PATH"
+chmod +x "$MONITOR_PATH"
 
-# === Detect available terminal emulator for launcher ===
-for term in gnome-terminal xfce4-terminal lxterminal mate-terminal konsole xterm alacritty kitty; do
-  command -v "$term" &>/dev/null && TERM_BIN="$term" && break
+# ============================================================
+# Write the 'stat' command launcher.
+# ============================================================
+cat > "$COMMAND_PATH" << 'COMMAND_EOF'
+#!/usr/bin/env bash
+# === SysMon launcher ===
+# stat          = start in current terminal
+# stat stop     = stop current terminal's SysMon
+# stat restart  = restart current terminal's SysMon
+# stat FILE...  = pass through to real stat, reducing command conflict.
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+MONITOR="$HOME/.local/bin/sysmon.sh"
+
+# Try to locate the real coreutils stat for pass-through.
+REAL_STAT=""
+for p in /usr/bin/stat /bin/stat /usr/local/bin/stat; do
+  if [ -x "$p" ]; then
+    REAL_STAT="$p"
+    break
+  fi
 done
 
-# === Build Exec command for Desktop file ===
-case "$TERM_BIN" in
-  gnome-terminal)  EXEC="gnome-terminal -- bash -c '$SCRIPT_PATH; exec bash'" ;;
-  xfce4-terminal)  EXEC="xfce4-terminal -e 'bash -c \"$SCRIPT_PATH; exec bash\"'" ;;
-  mate-terminal)   EXEC="mate-terminal -e 'bash -c \"$SCRIPT_PATH; exec bash\"'" ;;
-  lxterminal)      EXEC="lxterminal -e 'bash -c \"$SCRIPT_PATH; exec bash\"'" ;;
-  konsole)         EXEC="konsole -e bash -c '$SCRIPT_PATH; exec bash'" ;;
-  *)               EXEC="${TERM_BIN:-xterm} -e bash -c '$SCRIPT_PATH; exec bash'" ;;
+# Current terminal and per-terminal PID file.
+tty_name=$(tty 2>/dev/null || true)
+PID_FILE=""
+case "$tty_name" in
+  /dev/*)
+    tty_id=${tty_name#/dev/}
+    tty_id=${tty_id//\//_}
+    PID_FILE="$CACHE_DIR/sysmon-$tty_id.pid"
+    ;;
 esac
 
-# === Create Desktop launcher file ===
-cat > "$DESKTOP_FILE" << DESKTOP_EOF
+stop_sysmon() {
+  # Stop this terminal's monitor and reset terminal layout.
+  if [ -n "$PID_FILE" ] && [ -f "$PID_FILE" ]; then
+    pid=""
+    read -r pid < "$PID_FILE" 2>/dev/null || true
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+
+      # Brief wait for cleanup.
+      n=0
+      while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 40 ]; do
+        sleep 0.05
+        n=$((n+1))
+      done
+    fi
+    rm -f "$PID_FILE" 2>/dev/null || true
+  fi
+
+  # Reset wrap, scroll region, and clear screen/scrollback.
+  printf '\033[?7h\033[;r\033[H\033[2J\033[3J' 2>/dev/null || true
+}
+
+# --- Handle special commands ---
+if [ $# -gt 0 ]; then
+  case "$1" in
+    start)
+      shift
+      ;;
+    stop)
+      stop_sysmon
+      exit 0
+      ;;
+    restart)
+      stop_sysmon
+      exec "$0" start
+      ;;
+    *)
+      # Anything else is treated as a normal stat request.
+      if [ -n "$REAL_STAT" ]; then
+        exec "$REAL_STAT" "$@"
+      fi
+      echo "SysMon: system stat command not found." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# --- Start requires a terminal ---
+case "$tty_name" in
+  /dev/*) ;;
+  *)
+    echo "SysMon must be run in a terminal." >&2
+    exit 1
+    ;;
+esac
+
+# If already running in this terminal, do nothing.
+if [ -f "$PID_FILE" ]; then
+  pid=""
+  read -r pid < "$PID_FILE" 2>/dev/null || true
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    exit 0
+  fi
+  rm -f "$PID_FILE" 2>/dev/null || true
+fi
+
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+# Ready file lets the launcher wait until the first status draw is done.
+ready="$CACHE_DIR/sysmon.ready.$$"
+rm -f "$ready" 2>/dev/null || true
+
+# Start monitor in background and detach it from this shell job.
+SYSMON_TTY="$tty_name" SYSMON_READY="$ready" "$MONITOR" </dev/null >/dev/null 2>&1 &
+mon_pid=$!
+disown "$mon_pid" 2>/dev/null || true
+
+# Wait briefly for first draw, so prompt returns after the screen is prepared.
+n=0
+while [ ! -e "$ready" ] && [ "$n" -lt 60 ]; do
+  sleep 0.05
+  n=$((n+1))
+done
+rm -f "$ready" 2>/dev/null || true
+
+# If launcher child exited, confirm whether monitor is alive via PID file.
+if ! kill -0 "$mon_pid" 2>/dev/null; then
+  running=0
+  if [ -f "$PID_FILE" ]; then
+    pid=""
+    read -r pid < "$PID_FILE" 2>/dev/null || true
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && running=1
+  fi
+  if [ "$running" -eq 0 ]; then
+    echo "SysMon failed to start." >&2
+    exit 1
+  fi
+fi
+
+exit 0
+COMMAND_EOF
+
+chmod +x "$COMMAND_PATH"
+
+# ============================================================
+# Add ~/.local/bin to PATH in .bashrc if needed.
+# ============================================================
+PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+if [ -f "$HOME/.bashrc" ]; then
+  if ! grep -qsF "$PATH_LINE" "$HOME/.bashrc"; then
+    printf '\n# Added by SysMon installer\n%s\n' "$PATH_LINE" >> "$HOME/.bashrc"
+  fi
+else
+  printf '# Added by SysMon installer\n%s\n' "$PATH_LINE" >> "$HOME/.bashrc"
+fi
+
+# ============================================================
+# Desktop icon handling.
+# Terminal-only mode removes an old desktop icon.
+# Visual mode creates command + desktop icon.
+# ============================================================
+if [ "$MODE" = "visual" ]; then
+  TERM_BIN=""
+  for term in gnome-terminal xfce4-terminal lxterminal mate-terminal konsole xterm alacritty kitty; do
+    command -v "$term" >/dev/null 2>&1 && TERM_BIN="$term" && break
+  done
+
+  # Build terminal launcher command.
+  # The terminal runs 'stat', then keeps a shell open with 'exec bash'.
+  case "$TERM_BIN" in
+    gnome-terminal) EXEC="gnome-terminal -- bash -c '$COMMAND_PATH; exec bash'" ;;
+    xfce4-terminal) EXEC="xfce4-terminal -e 'bash -c \"$COMMAND_PATH; exec bash\"'" ;;
+    mate-terminal)  EXEC="mate-terminal -e 'bash -c \"$COMMAND_PATH; exec bash\"'" ;;
+    lxterminal)     EXEC="lxterminal -e 'bash -c \"$COMMAND_PATH; exec bash\"'" ;;
+    konsole)        EXEC="konsole -e bash -c '$COMMAND_PATH; exec bash'" ;;
+    alacritty)      EXEC="alacritty -e bash -c '$COMMAND_PATH; exec bash'" ;;
+    kitty)          EXEC="kitty bash -c '$COMMAND_PATH; exec bash'" ;;
+    *)              EXEC="${TERM_BIN:-xterm} -e bash -c '$COMMAND_PATH; exec bash'" ;;
+  esac
+
+  cat > "$DESKTOP_PATH" << DESKTOP_EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -132,9 +695,27 @@ Terminal=false
 Categories=System;Monitor;
 DESKTOP_EOF
 
-# === Finalize launcher and run monitor ===
-chmod +x "$DESKTOP_FILE"
-command -v gio &>/dev/null && gio set "$DESKTOP_FILE" metadata::trusted true 2>/dev/null
+  chmod +x "$DESKTOP_PATH"
 
-exec bash "$SCRIPT_PATH"
+  # Mark desktop file trusted on GNOME-based desktops where possible.
+  command -v gio >/dev/null 2>&1 && gio set "$DESKTOP_PATH" metadata::trusted true 2>/dev/null || true
+else
+  rm -f "$DESKTOP_PATH"
+fi
+
+# ============================================================
+# Final user message.
+# ============================================================
+cat << MSG
+SysMon installed in $MODE mode.
+
+Start:   stat
+Stop:    stat stop
+Restart: stat restart
+
+If 'stat' is not found yet, run:
+  export PATH="\$HOME/.local/bin:\$PATH"
+  hash -r
+or open a new terminal.
+MSG
 INSTALL
