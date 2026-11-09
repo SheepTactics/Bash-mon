@@ -1,6 +1,6 @@
 # Bash-Mon
 
-Bash-Mon is a live, lightweight system monitor designed for the terminal. It is Raspberry Pi friendly and displays temperature, CPU, RAM, voltage, disk read/write, and network I/O statistics.
+Bash-Mon is a live, lightweight system monitor designed for the terminal. It is Raspberry Pi friendly and displays temperature, CPU, RAM, voltage, disk read/write, and network I/O statistics in a usable terminal.
 
 ![System Monitor](Sysmon-v1.0.1B)
 ![System Monitor](2Sysmon-v1.0.1B)
